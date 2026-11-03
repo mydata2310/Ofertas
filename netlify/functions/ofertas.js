@@ -1,4 +1,4 @@
-// Ofertas multi-tienda. ?min=10&q=leche  |  ?diag=1 para diagnosticar cada tienda
+// Ofertas multi-tienda. ?min=10&q=leche | ?diag=1 diagnóstico | ?probe=slug-del-producto
 const H = {
   "user-agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
   accept: "text/html,application/json;q=0.9,*/*;q=0.8",
@@ -30,18 +30,34 @@ const oferta = (t, nombre, precio, antes, url, img) =>
     ? { tienda: t.n, nombre, precio, antes, desc: Math.round(100 * (1 - precio / antes)), url, img: img || "" }
     : null;
 
+// VTEX: dos fuentes en paralelo (buscador inteligente + API clásica), 6 páginas cada una
 async function vtex(t, out) {
-  for (let i = 0; i < 200; i += 50) {
-    const j = await J(`${t.base}/api/catalog_system/pub/products/search?O=OrderByBestDiscountDESC&_from=${i}&_to=${i + 49}`);
-    if (!Array.isArray(j)) throw new Error("no VTEX");
-    let n = 0;
-    for (const p of j) for (const s of p.items || []) {
+  const vistos = new Set();
+  const add = (p) => {
+    for (const s of p.items || []) {
       const o = s.sellers?.find(x => x.commertialOffer?.AvailableQuantity > 0)?.commertialOffer;
-      const x = o && oferta(t, p.productName, o.Price, o.ListPrice, p.link || `${t.base}/${p.linkText}/p`, s.images?.[0]?.imageUrl);
-      if (x) { out.push(x); n++; break; }
+      if (!o) continue;
+      const antes = Math.max(o.ListPrice || 0, o.PriceWithoutDiscount || 0);
+      const x = oferta(t, p.productName, o.Price, antes, p.link || `${t.base}/${p.linkText}/p`, s.images?.[0]?.imageUrl);
+      if (x && !vistos.has(x.url)) { vistos.add(x.url); out.push(x); }
+      break;
     }
-    if (j.length < 50 || !n) break;
-  }
+  };
+  const paginar = async (url) => {
+    const rs = await Promise.allSettled([0, 1, 2, 3, 4, 5].map(url));
+    const ok = rs.filter(r => r.status === "fulfilled").map(r => r.value);
+    if (!ok.length) throw rs[0].reason;
+    return ok;
+  };
+  const rs = await Promise.allSettled([
+    paginar(i => J(`${t.base}/api/io/_v/api/intelligent-search/product_search?page=${i + 1}&count=50&sort=discount%3Adesc&locale=es-SV`))
+      .then(a => a.flatMap(j => j.products || [])),
+    paginar(i => J(`${t.base}/api/catalog_system/pub/products/search?O=OrderByBestDiscountDESC&_from=${i * 50}&_to=${i * 50 + 49}`))
+      .then(a => a.filter(Array.isArray).flat()),
+  ]);
+  const ok = rs.filter(r => r.status === "fulfilled");
+  if (!ok.length) throw new Error(rs.map(r => r.reason.message).join(" / "));
+  ok.forEach(r => r.value.forEach(add));
 }
 
 async function shopify(t, out) {
@@ -71,7 +87,7 @@ async function woo(t, out) {
   }
 }
 
-// Magento: lee las páginas de listado de promociones (HTML) y saca precios de data-price-amount
+// Magento: lee listados de promociones (HTML) con data-price-amount
 async function magento(t, out) {
   const urls = [];
   for (const p of t.paths || ["/promociones/ofertas.html"])
@@ -108,7 +124,6 @@ async function tienda(t) {
   throw new Error(rs.map((r, i) => ms[i] + ": " + r.reason.message).join(" | "));
 }
 
-// Diagnóstico: "visita" la home y prueba cada método
 async function diag(t) {
   const r = { tienda: t.n, base: t.base, metodos: {} };
   try {
@@ -121,18 +136,29 @@ async function diag(t) {
     };
   } catch (e) { r.home = { error: e.message }; }
   await Promise.all(Object.keys(M).map(async m => {
-    try { const o = []; await M[m]({ ...t, paths: t.paths }, o); r.metodos[m] = o.length + " ofertas"; }
+    try { const o = []; await M[m](t, o); r.metodos[m] = o.length + " ofertas"; }
     catch (e) { r.metodos[m] = "falló: " + e.message; }
   }));
   return r;
 }
 
+const json = (b, c = 200) => ({ statusCode: c, headers: { "content-type": "application/json" }, body: JSON.stringify(b, null, 1) });
+
 exports.handler = async (ev) => {
   const q = ev.queryStringParameters || {};
-  if (q.diag) {
-    const d = await Promise.all(TIENDAS.map(diag));
-    return { statusCode: 200, headers: { "content-type": "application/json" }, body: JSON.stringify(d, null, 1) };
+  if (q.diag) return json(await Promise.all(TIENDAS.map(diag)));
+
+  if (q.probe) { // precios crudos de un producto VTEX: ?probe=slug&t=walmart
+    const t = TIENDAS.find(x => x.n.toLowerCase() === (q.t || "walmart").toLowerCase());
+    const j = await J(`${t.base}/api/catalog_system/pub/products/search/${q.probe}/p`).catch(e => ({ error: e.message }));
+    return json(Array.isArray(j)
+      ? j.flatMap(p => p.items.flatMap(s => s.sellers.map(v => ({
+          nombre: p.productName,
+          ...Object.fromEntries(["Price", "ListPrice", "PriceWithoutDiscount", "AvailableQuantity"].map(k => [k, v.commertialOffer?.[k]])),
+        }))))
+      : j);
   }
+
   const min = +q.min || 0, txt = (q.q || "").toLowerCase();
   const errores = [], todo = [];
   await Promise.all(TIENDAS.map(async t => {
