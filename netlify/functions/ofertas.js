@@ -30,31 +30,45 @@ const oferta = (t, nombre, precio, antes, url, img) =>
     ? { tienda: t.n, nombre, precio, antes, desc: Math.round(100 * (1 - precio / antes)), url, img: img || "" }
     : null;
 
-// VTEX: dos fuentes en paralelo (buscador inteligente + API clásica), 6 páginas cada una
+// VTEX: dos fuentes (buscador inteligente + API clásica) leídas por lotes de páginas
+// hasta que el descuento baje del mínimo pedido (t.min), con tope de páginas y de tiempo.
 async function vtex(t, out) {
   const vistos = new Set();
-  const add = (p) => {
+  const calc = (p) => {
     for (const s of p.items || []) {
       const o = s.sellers?.find(x => x.commertialOffer?.AvailableQuantity > 0)?.commertialOffer;
       if (!o) continue;
       const antes = Math.max(o.ListPrice || 0, o.PriceWithoutDiscount || 0);
-      const x = oferta(t, p.productName, o.Price, antes, p.link || `${t.base}/${p.linkText}/p`, s.images?.[0]?.imageUrl);
-      if (x && !vistos.has(x.url)) { vistos.add(x.url); out.push(x); }
-      break;
+      return oferta(t, p.productName, o.Price, antes, p.link || `${t.base}/${p.linkText}/p`, s.images?.[0]?.imageUrl);
     }
+    return null;
   };
-  const paginar = async (url) => {
-    const rs = await Promise.allSettled([0, 1, 2, 3, 4, 5].map(url));
-    const ok = rs.filter(r => r.status === "fulfilled").map(r => r.value);
-    if (!ok.length) throw rs[0].reason;
-    return ok;
+  const add = (p) => {
+    const x = calc(p);
+    if (x && !vistos.has(x.url)) { vistos.add(x.url); out.push(x); }
   };
-  const rs = await Promise.allSettled([
-    paginar(i => J(`${t.base}/api/io/_v/api/intelligent-search/product_search?page=${i + 1}&count=50&sort=discount%3Adesc&locale=es-SV`))
-      .then(a => a.flatMap(j => j.products || [])),
-    paginar(i => J(`${t.base}/api/catalog_system/pub/products/search?O=OrderByBestDiscountDESC&_from=${i * 50}&_to=${i * 50 + 49}`))
-      .then(a => a.filter(Array.isArray).flat()),
-  ]);
+  const IS = i => J(`${t.base}/api/io/_v/api/intelligent-search/product_search?page=${i + 1}&count=50&sort=discount%3Adesc&locale=es-SV`)
+    .then(j => j.products || []);
+  const CL = i => J(`${t.base}/api/catalog_system/pub/products/search?O=OrderByBestDiscountDESC&_from=${i * 50}&_to=${i * 50 + 49}`)
+    .then(a => (Array.isArray(a) ? a : []));
+
+  const LOTE = 6, MAX = 36, piso = Math.max(t.min || 0, 1);
+  const fuente = async (pag) => {
+    const t0 = Date.now(), todos = [];
+    for (let i = 0; i < MAX; i += LOTE) {
+      const rs = await Promise.allSettled(Array.from({ length: LOTE }, (_, k) => pag(i + k)));
+      const lotes = rs.filter(r => r.status === "fulfilled").map(r => r.value);
+      if (!lotes.length) { if (!i) throw rs[0].reason; break; }
+      const prods = lotes.flat();
+      if (!prods.length) break;
+      todos.push(...prods);
+      const mejor = Math.max(0, ...prods.map(p => calc(p)?.desc || 0));
+      if (mejor < piso || Date.now() - t0 > 5500) break;
+    }
+    return todos;
+  };
+
+  const rs = await Promise.allSettled([fuente(IS), fuente(CL)]);
   const ok = rs.filter(r => r.status === "fulfilled");
   if (!ok.length) throw new Error(rs.map(r => r.reason.message).join(" / "));
   ok.forEach(r => r.value.forEach(add));
@@ -91,7 +105,7 @@ async function woo(t, out) {
 async function magento(t, out) {
   const urls = [];
   for (const p of t.paths || ["/promociones/ofertas.html"])
-    for (let n = 1; n <= 6; n++) urls.push(`${t.base}${p}?p=${n}&product_list_limit=32`);
+    for (let n = 1; n <= 12; n++) urls.push(`${t.base}${p}?p=${n}&product_list_limit=32`);
   let tarjetas = 0, ultimo = "";
   await Promise.all(urls.map(async u => {
     try {
@@ -163,7 +177,7 @@ exports.handler = async (ev) => {
   const errores = [], todo = [];
   await Promise.all(TIENDAS.map(async t => {
     try {
-      todo.push(...await Promise.race([tienda(t), new Promise((_, no) => setTimeout(() => no(new Error("tiempo agotado")), 8500))]));
+      todo.push(...await Promise.race([tienda({ ...t, min }), new Promise((_, no) => setTimeout(() => no(new Error("tiempo agotado")), 8500))]));
     } catch (e) { errores.push({ tienda: t.n, error: e.message }); }
   }));
   const seen = new Set();
@@ -171,7 +185,7 @@ exports.handler = async (ev) => {
     .filter(x => x.desc >= min && x.nombre.toLowerCase().includes(txt))
     .filter(x => !seen.has(x.url) && seen.add(x.url))
     .sort((a, b) => b.desc - a.desc)
-    .slice(0, 300);
+    .slice(0, 500);
   return {
     statusCode: 200,
     headers: { "content-type": "application/json", "cache-control": "public, max-age=1800" },
